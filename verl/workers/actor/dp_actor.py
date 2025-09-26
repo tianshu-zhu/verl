@@ -290,7 +290,7 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
         # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
+        if not torch.isfinite(grad_norm) or grad_norm >= self.config.grad_norm_threshold:
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
@@ -384,6 +384,15 @@ class DataParallelPPOActor(BasePPOActor):
                 "and is not currently supported in Server mode (agent loop)."
             )
             select_keys.append("rollout_log_probs")
+            
+        if 'traj_mask' in data.batch:
+            select_keys.append('traj_mask')
+
+            if 'is_pad_step' in data.non_tensor_batch:
+                is_pad_step = data.non_tensor_batch["is_pad_step"]
+                pad_step_indices = np.where(is_pad_step == True)[0]
+                if len(pad_step_indices) > 0:
+                    data.batch["advantages"][pad_step_indices] = 0
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -397,6 +406,7 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -414,7 +424,11 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    if "traj_mask" in model_inputs:
+                        response_mask = model_inputs["traj_mask"]
+                        print("[TrainingLogs] Using mask schema from traj mask!")
+                    else:
+                        response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]

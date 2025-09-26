@@ -27,8 +27,9 @@ from vllm import SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse
+from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, CompletionRequest, CompletionResponse
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
 from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
@@ -275,14 +276,15 @@ class AsyncvLLMServer(AsyncServerBase):
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=self.max_model_len,
-            max_num_seqs=config.max_num_seqs,
             load_format="dummy" if config.load_format.startswith("dummy") else config.load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            seed=self.vllm_dp_rank, #config.get("seed", 0),
+            max_num_seqs=256,
+            hf_overrides={"max_position_embeddings": max_model_len},
             **compilation_config,
             **engine_kwargs,
         )
@@ -305,6 +307,14 @@ class AsyncvLLMServer(AsyncServerBase):
             chat_template_content_format="auto",
             enable_auto_tools=config.multi_turn.tool_config_path is not None,
             tool_parser=config.multi_turn.format,  # hermes, llama3_json, ...
+        )
+        
+        self.openai_serving_completion = OpenAIServingCompletion(
+            self.engine,
+            model_config,
+            models,
+            request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
+            return_tokens_as_token_ids=True,
         )
 
         # used for Qwen2.5-VL
@@ -339,6 +349,27 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, ChatCompletionResponse)
+            return JSONResponse(content=generator.model_dump())
+        
+    #add completions
+    async def completions(self, raw_request: Request):
+        """OpenAI completions API.
+
+        API reference: https://platform.openai.com/docs/api-reference/completions/create
+        """
+        request_json = await raw_request.json()
+        request = CompletionRequest(**request_json)
+        generator = await self.openai_serving_completion.create_completion(request, raw_request)
+        if isinstance(generator, ErrorResponse):
+            return JSONResponse(content=generator.model_dump(), status_code=generator.code)
+        if request.stream:
+            return StreamingResponse(content=generator, media_type="text/event-stream")
+        else:
+            assert isinstance(generator, CompletionResponse)
+            if generator.choices and generator.choices[0].logprobs:
+                generator.choices[0].logprobs.token_logprobs = [] 
+                generator.choices[0].logprobs.top_logprobs = []
+                generator.choices[0].logprobs.text_offset = []
             return JSONResponse(content=generator.model_dump())
 
     async def generate(
