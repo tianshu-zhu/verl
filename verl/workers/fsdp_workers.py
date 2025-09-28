@@ -827,8 +827,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
             # perform training
+            print("[TrainingLogs] current fsdp_workers is running update policy")
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+            print("[TrainingLogs] current fsdp_workers finished with update policy")
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -842,7 +844,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
             self.actor_lr_scheduler.step()
-
+            
+#             non_tensor_dict = {}
+#             # TODO: here, we should return all metrics
+#             if "logs_prob_list" in metrics:
+#                 logs_prob_list = metrics["logs_prob_list"]
+#                 non_tensor_dict["non_tensor_dict"] = non_tensor_dict
+#                 del metrics["logs_prob_list"]
+#             if "old_logs_prob_list" in metrics:
+#                 old_logs_prob_list = metrics["old_logs_prob_list"]
+#                 non_tensor_dict["old_logs_prob_list"] = old_logs_prob_list
+#                 del metrics["old_logs_prob_list"]
+#             if "advantage_list" in metrics:
+#                 advantage_list = metrics["advantage_list"]
+#                 non_tensor_dict["advantage_list"] = advantage_list
+#                 del metrics["advantage_list"]
+#             if "response_mask_list" in metrics:
+#                 response_mask_list = metrics["response_mask_list"]
+#                 non_tensor_dict["response_mask_list"] = response_mask_list
+#                 del metrics["response_mask_list"]
+                
+#             output = DataProto.from_dict(non_tensors=non_tensor_dict, meta_info={"metrics": metrics})
+            
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
 

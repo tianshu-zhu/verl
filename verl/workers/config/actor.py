@@ -121,6 +121,7 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    grad_norm_threshold: float = 1e5
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -144,6 +145,7 @@ class ActorConfig(BaseConfig):
             "seq-mean-token-sum",
             "seq-mean-token-mean",
             "seq-mean-token-sum-norm",
+            "seq-mean-token-sum-div-length"
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")

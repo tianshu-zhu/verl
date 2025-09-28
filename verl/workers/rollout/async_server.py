@@ -65,6 +65,8 @@ class AsyncServerBase(ABC):
 
         app = fastapi.FastAPI(lifespan=lifespan)
         app.router.add_api_route("/v1/chat/completions", self.chat_completion, methods=["POST"])
+        #add completions
+        app.router.add_api_route("/v1/completions", self.completions, methods=["POST"])
 
         self.port = _get_free_port()
         config = uvicorn.Config(app, host=["::", "0.0.0.0"], port=self.port, log_level="warning")
@@ -87,6 +89,14 @@ class AsyncServerBase(ABC):
             JSONResponse: json response
 
         API reference: https://platform.openai.com/docs/api-reference/chat/create
+        """
+        raise NotImplementedError
+        
+    @abstractmethod
+    async def completions(self, raw_request: Request):
+        """OpenAI completions API.
+
+        API reference: https://platform.openai.com/docs/api-reference/completions/create
         """
         raise NotImplementedError
 

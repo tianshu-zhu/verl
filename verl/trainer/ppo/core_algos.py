@@ -100,6 +100,7 @@ class AdvantageEstimator(str, Enum):
     REMAX = "remax"
     RLOO = "rloo"
     OPO = "opo"
+    LOOP = 'loop'
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
 
@@ -324,6 +325,46 @@ def compute_grpo_outcome_advantage(
 
     return scores, scores
 
+@register_adv_est(AdvantageEstimator.LOOP)  # or simply: @register_adv_est("grpo_passk")
+def compute_loop_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   eos_mask: torch.Tensor,
+                                   index: torch.Tensor):
+    """
+    Compute advantage for LOOP which is same as GRPO without normalization based on https://arxiv.org/pdf/2502.01600
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2samples = defaultdict(list)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2samples[index[i]].append((i, scores[i]))
+        for group in id2samples.values():
+            group_size = len(group)
+            total_score = sum(score for _, score in group)
+            for i, score in group: # i is original index
+                loo_baseline = 0
+                if group_size == 1:
+                    print("Cannot compute LOO advantage using 1 sample. 0 baseline is used")
+                else:
+                    loo_baseline = (total_score - score) / (group_size - 1)
+                scores[i] = score - loo_baseline
+        
+        scores = scores.unsqueeze(-1) * eos_mask
+    return scores, scores
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
 def compute_grpo_passk_outcome_advantage(
@@ -718,6 +759,10 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     """
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
+    elif loss_agg_mode == "seq-mean-token-sum-div-length":
+        response_length = loss_mat.shape[-1]
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / response_length  # token-sum
+        loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
@@ -812,6 +857,79 @@ def compute_policy_loss(
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
+@register_policy_loss("vanilla_v2")
+def compute_policy_loss_vanilla_v2(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_log_probs=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective and related metrics for PPO.
+
+    Adapted from
+    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+        rollout_log_probs: `(torch.Tensor)`:
+            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+    """
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    cliprange = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+    print(f"[TrainingLogs] current loss param is clip_ratio={cliprange}, clip_ratio_low={cliprange_low}, clip_ratio_high={cliprange_high}, clip_ratio_c={clip_ratio_c}")
+    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
+
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low,
+                                           1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    pg_losses3 = -advantages * clip_ratio_c
+    
+    
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    # Dual-clip PPO
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+
+    # Remove the dual-clip PPO for now... (there's no evidence it improves performance)
+    pg_losses = clip_pg_losses1 #torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    # Statistics tracked for PPO.
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+    
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 @register_policy_loss("vanilla")
 def compute_policy_loss_vanilla(

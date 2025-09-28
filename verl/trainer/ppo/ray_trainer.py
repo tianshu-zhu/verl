@@ -201,6 +201,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    **kwargs
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -253,6 +254,13 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.LOOP:
+        # same as grpo but without normalization
+        advantages, returns = core_algos.compute_loop_outcome_advantage(token_level_rewards=data.batch['token_level_rewards'],
+                                                                        eos_mask=data.batch['response_mask'],
+                                                                        index=data.non_tensor_batch['uid'])
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -428,7 +436,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, **kwargs):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -437,10 +445,15 @@ class RayPPOTrainer:
         base_data = {
             "input": inputs,
             "output": outputs,
-            "gts": gts,
             "score": scores,
             "step": [self.global_steps] * n,
         }
+        if gts:
+            base_data["gts"] = gts
+            
+        for k, v in kwargs.items():
+            if v:
+                base_data[k] = v
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
