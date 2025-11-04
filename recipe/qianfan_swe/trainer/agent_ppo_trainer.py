@@ -557,11 +557,12 @@ class AgentPPOTrainer(RayPPOTrainer):
         all_initial_tokens_list = []
         all_response_tokens_list = []
         all_masks_list = []
+        all_inf_log_probs_list = []  # Store inference log probs from vLLM (Token mode)
         traj_scores = []
         chat_completions = []
         traj_metrics = []
         metrics = {}
-        
+
         down_infos = []
 
         for traj in trajectories:
@@ -573,6 +574,16 @@ class AgentPPOTrainer(RayPPOTrainer):
             all_response_tokens_list.append(response_tokens)
             all_masks_list.append(traj["response_masks"])
             traj_scores.append(traj["trajectory_reward"])
+
+            # Get inference log probs if available
+            traj_inf_log_probs = traj.get("inf_log_probs", None)
+            all_inf_log_probs_list.append(traj_inf_log_probs)
+
+            # Only log for first trajectory to avoid spam
+            if len(all_inf_log_probs_list) == 1 and traj_inf_log_probs is not None:
+                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_trajectories - "
+                      f"First trajectory inf_log_probs shape={traj_inf_log_probs.shape}")
+
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
             down_infos.append(
@@ -636,6 +647,27 @@ class AgentPPOTrainer(RayPPOTrainer):
         max_response_length = self.config.data.max_response_length
         response_batch = pad_sequence_to_length(response_batch, max_response_length, self.tokenizer.pad_token_id, left_pad=False)
 
+        # Process inference log probs: pad to match response_batch shape
+        inf_log_probs_batch = None
+        if all_inf_log_probs_list and any(x is not None for x in all_inf_log_probs_list):
+            padded_inf_log_probs = []
+            for i, inf_log_probs in enumerate(all_inf_log_probs_list):
+                response_len = all_response_tokens_list[i].shape[0]
+                if inf_log_probs is not None and inf_log_probs.shape[0] == response_len:
+                    # Pad to max_response_length with 0.0
+                    padded = torch.nn.functional.pad(inf_log_probs, (0, max_response_length - response_len), value=0.0)
+                    padded_inf_log_probs.append(padded)
+                else:
+                    # Use zeros if not available or length mismatch
+                    padded_inf_log_probs.append(torch.zeros(max_response_length, dtype=torch.float32))
+            inf_log_probs_batch = torch.stack(padded_inf_log_probs, dim=0)
+
+            if inf_log_probs_batch is not None:
+                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_trajectories - "
+                      f"Created inf_log_probs_batch, shape={inf_log_probs_batch.shape}, "
+                      f"mean={inf_log_probs_batch.mean().item():.4f}, "
+                      f"non_zero_ratio={(inf_log_probs_batch != 0.0).sum().item() / inf_log_probs_batch.numel():.4f}")
+
         traj_mask = torch.nn.utils.rnn.pad_sequence(all_masks_list, batch_first=True, padding_value=0)
         traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
 
@@ -666,6 +698,10 @@ class AgentPPOTrainer(RayPPOTrainer):
             "token_level_scores": score_batch,
             "traj_mask": traj_mask,
         }
+
+        # Add inference log probs if available
+        if inf_log_probs_batch is not None:
+            tensor_batch["inf_log_probs"] = inf_log_probs_batch
 
         self.visualize_trajectory(DataProto.from_dict(tensors=tensor_batch))
 
@@ -787,6 +823,7 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         all_prompts_list = []
         all_responses_list = []
+        all_inf_log_probs_list = []  # Store inference log probs from vLLM
 
         step_numbers = []  # number of steps of each episode, 0 indexed
         all_steps_idx_list = []
@@ -802,9 +839,14 @@ class AgentPPOTrainer(RayPPOTrainer):
             idx = episode["idx"]
             training_reward = episode["trajectory_reward"]
             mc_returns = episode["mc_returns"]
+            inf_log_probs_per_episode = episode.get("inf_log_probs", [None] * len(episode_steps))
 
             all_prompts_list.extend([torch.tensor(self.tokenizer.encode(s["prompt"], add_special_tokens=False), dtype=torch.long) for s in episode_steps])
             all_responses_list.extend([torch.tensor(self.tokenizer.encode(s["response"], add_special_tokens=False), dtype=torch.long) for s in episode_steps])
+
+            # Store inference log probs for each step
+            for step_inf_log_probs in inf_log_probs_per_episode:
+                all_inf_log_probs_list.append(step_inf_log_probs if step_inf_log_probs is not None else None)
 
             step_numbers.append(len(episode_steps) - 1)
             training_rewards.append(training_reward)
@@ -835,6 +877,27 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         max_response_length = self.config.data.max_response_length
         response_batch = pad_sequence_to_length(response_batch, max_response_length, self.tokenizer.pad_token_id, left_pad=False)
+
+        # Process inference log probs: pad/truncate to match response_batch shape
+        inf_log_probs_batch = None
+        if all_inf_log_probs_list and any(x is not None for x in all_inf_log_probs_list):
+            padded_inf_log_probs = []
+            for i, inf_log_probs in enumerate(all_inf_log_probs_list):
+                response_len = all_responses_list[i].shape[0]
+                if inf_log_probs is not None and inf_log_probs.shape[0] == response_len:
+                    # Pad to max_response_length with 0.0
+                    padded = torch.nn.functional.pad(inf_log_probs, (0, max_response_length - response_len), value=0.0)
+                    padded_inf_log_probs.append(padded)
+                else:
+                    # Use zeros if not available or length mismatch
+                    padded_inf_log_probs.append(torch.zeros(max_response_length, dtype=torch.float32))
+            inf_log_probs_batch = torch.stack(padded_inf_log_probs, dim=0)
+
+            if inf_log_probs_batch is not None:
+                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_steps - "
+                      f"Created inf_log_probs_batch, shape={inf_log_probs_batch.shape}, "
+                      f"mean={inf_log_probs_batch.mean().item():.4f}, "
+                      f"non_zero_ratio={(inf_log_probs_batch != 0.0).sum().item() / inf_log_probs_batch.numel():.4f}")
 
         complete_step_batch = torch.concat([prompts_batch, response_batch], dim=1)
         attention_mask = torch.where(complete_step_batch != self.tokenizer.pad_token_id, 1, 0)
@@ -872,6 +935,10 @@ class AgentPPOTrainer(RayPPOTrainer):
             "mc_returns": mc_return_batch,
             "traj_mask": traj_mask,
         }
+
+        # Add inference log probs if available
+        if inf_log_probs_batch is not None:
+            tensor_batch["inf_log_probs"] = inf_log_probs_batch
 
         batch_id = str(uuid.uuid4())
         non_tensor_batch = {

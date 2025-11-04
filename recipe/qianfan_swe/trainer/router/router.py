@@ -328,7 +328,43 @@ class Router:
         end_time = time.time()
         print(f"[TrainingLogsRouter] current idx is {idx}, current application id is {application_id}, request address is {address}, model is {self.model_name}, kwargs is {kwargs}, cost time {end_time - start_time}")
 
-        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"])
+        # Extract inference log probs for IcePop
+        batch_inference_logprobs = []
+        for batch_index, completions in enumerate(completions_list):
+            inf_logprobs = []
+            for choice in completions.get("choices", []):
+                logprobs_data = choice.get("logprobs", {})
+                token_logprobs = logprobs_data.get("token_logprobs", [])
+                tokens = logprobs_data.get("tokens", [])
+
+                # vLLM returns prompt+response logprobs, slice to get response only
+                if tokens and token_logprobs:
+                    response_length = len(tokens)
+                    response_logprobs = token_logprobs[-response_length:] if len(token_logprobs) >= response_length else token_logprobs
+                    inf_logprobs.append(response_logprobs)
+                else:
+                    inf_logprobs.append(token_logprobs)
+            batch_inference_logprobs.append(inf_logprobs)
+
+            # Debug logging for IcePop (only first prompt to avoid spam)
+            if batch_index == 0 and inf_logprobs and len(inf_logprobs) > 0 and len(inf_logprobs[0]) > 0:
+                sample_values = inf_logprobs[0][:20] if len(inf_logprobs[0]) >= 20 else inf_logprobs[0]
+                print(f"\n[IcePop-DEBUG] router.py: vLLM Extraction Details")
+                print(f"  batch_index={batch_index}, num_choices={len(inf_logprobs)}")
+                print(f"  first_choice_tokens={len(inf_logprobs[0])}")
+                print(f"  Sample logprobs (first 20): {[f'{x:.6f}' for x in sample_values]}")
+                print(f"  Min: {min(inf_logprobs[0]):.6f}, Max: {max(inf_logprobs[0]):.6f}")
+                print(f"  Mean: {sum(inf_logprobs[0])/len(inf_logprobs[0]):.6f}")
+                # Check if values look like probabilities (>0) instead of log probs (<0)
+                positive_count = sum(1 for x in inf_logprobs[0] if x > 0)
+                if positive_count > 0:
+                    print(f"  ⚠️  WARNING: {positive_count} positive values found! These should be negative (log probs)!")
+                near_zero_count = sum(1 for x in inf_logprobs[0] if x > -0.01 and x < 0)
+                if near_zero_count > len(inf_logprobs[0]) * 0.5:
+                    print(f"  ⚠️  WARNING: {near_zero_count}/{len(inf_logprobs[0])} values very close to 0!")
+                    print(f"      This might indicate probabilities instead of log probabilities!")
+
+        return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"], batch_inference_logprobs)
 
     async def submit_completions(self, address, model, prompt, **kwargs):
         """
@@ -342,7 +378,7 @@ class Router:
         # Potential blocking: network I/O can block
         return await poll_completions_openai(address=address, model=model, prompt=prompt, **kwargs)
 
-    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int) -> DataProto:
+    async def postprocess_batch(self, batch: DataProto, response_ids: list[list[int]], n: int, inference_logprobs: list[list[list[float]]] = None) -> DataProto:
         """
         Postprocess the batch of responses from the model server.
         
@@ -397,6 +433,27 @@ class Router:
         response_attention_mask = get_response_mask(response_id=response_tensor, eos_token=self.eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
+        # Process inference log probs if provided
+        inf_log_probs_tensor = None
+        if inference_logprobs is not None:
+            # Flatten inference_logprobs similar to response_ids
+            flat_inf_logprobs = []
+            for inf_logprobs_per_prompt in inference_logprobs:
+                if inf_logprobs_per_prompt is not None:
+                    for inf_logprobs in inf_logprobs_per_prompt:
+                        flat_inf_logprobs.append(inf_logprobs)
+
+            # Pad to same length as response_tensor
+            inf_log_probs_tensor = pad_2d_list_to_length(
+                flat_inf_logprobs,
+                0.0,  # Pad with 0.0 for log probs
+                max_length=self.config.actor_rollout_ref.rollout.response_length
+            ).to(idx.device)
+
+            print(f"[IcePop] router.py: postprocess_batch - inf_log_probs_tensor shape={inf_log_probs_tensor.shape}, "
+                  f"mean={inf_log_probs_tensor.mean().item():.4f}, "
+                  f"non_zero_ratio={(inf_log_probs_tensor != 0.0).sum().item() / inf_log_probs_tensor.numel():.4f}")
+
         output = TensorDict(
             {
                 "prompts": idx,
@@ -407,4 +464,9 @@ class Router:
             },
             batch_size=batch_size,
         )
+
+        # Add inference log probs if available
+        if inf_log_probs_tensor is not None:
+            output["inf_log_probs"] = inf_log_probs_tensor
+
         return DataProto(batch=output, meta_info=batch.meta_info)

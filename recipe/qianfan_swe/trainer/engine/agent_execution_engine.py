@@ -187,6 +187,9 @@ class AgentExecutionEngine:
         else:
             self.chat_parser = chat_parser
 
+        # Cache for storing inference log probs per application_id for IcePop
+        self.inf_logprobs_cache = {}
+
 
     async def get_model_response(self, messages, application_id, **kwargs):
         """
@@ -201,13 +204,15 @@ class AgentExecutionEngine:
             **kwargs: Additional arguments to pass to the model
 
         Returns:
-            The model's response text
+            str: The model's response text (log probs are cached for per-step alignment)
 
         Raises:
             NotImplementedError: If the engine type is not supported
         """
         if self.engine_name == "verl":
-            return await self._get_verl_async(messages, application_id, **kwargs)
+            # _get_verl_async returns response string (log probs are cached internally)
+            response = await self._get_verl_async(messages, application_id, **kwargs)
+            return response
         else:
             raise NotImplementedError(f"Engine type '{self.engine_name}' not supported")
 
@@ -256,6 +261,14 @@ class AgentExecutionEngine:
 
         output = await self.router.generate_sequences(batch, application_id=application_id, **kwargs)
 
+        # Extract inference log probs for IcePop if available
+        inf_log_probs = None
+        if "inf_log_probs" in output.batch:
+            inf_log_probs = output.batch["inf_log_probs"][0]  # Shape: (response_length,)
+            if inf_log_probs is not None:
+                print(f"[IcePop] agent_execution_engine.py: _get_verl_async - Extracted inf_log_probs, "
+                      f"shape={inf_log_probs.shape}, mean={inf_log_probs.mean().item():.4f}")
+
         attn = output.batch["attention_mask"][0, self.max_prompt_length :]
         tokens = output.batch["responses"][0]
 
@@ -263,15 +276,31 @@ class AgentExecutionEngine:
         non_pad_indices = (attn == 1).nonzero(as_tuple=True)[0]
         if len(non_pad_indices) == 0:
             trimmed = tokens[:0]  # empty
+            trimmed_log_probs = None
         else:
             last_valid_idx = non_pad_indices[-1].item()
             trimmed = tokens[: last_valid_idx + 1]  # include the last valid token
+            # Trim log probs to match trimmed tokens
+            if inf_log_probs is not None:
+                trimmed_log_probs = inf_log_probs[: last_valid_idx + 1]
+            else:
+                trimmed_log_probs = None
 
         response = self.tokenizer.decode(trimmed, skip_special_tokens=False)
 
         pad_token = self.tokenizer.pad_token
         eos_token = self.tokenizer.eos_token
         response = response.replace(pad_token, "").replace(eos_token, "")
+
+        # Cache log probs for per-step alignment
+        # (Will be aligned with re-tokenized assistant messages later)
+        if trimmed_log_probs is not None:
+            if application_id not in self.inf_logprobs_cache:
+                self.inf_logprobs_cache[application_id] = []
+            self.inf_logprobs_cache[application_id].append(trimmed_log_probs)
+            print(f"[IcePop] agent_execution_engine.py: _get_verl_async - Cached {trimmed_log_probs.shape[0]} log probs for step {len(self.inf_logprobs_cache[application_id])}")
+
+        # Return ONLY response (agent.run_trajectory expects string, not tuple!)
         return response
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
@@ -398,12 +427,57 @@ class AgentExecutionEngine:
 
             response_tokens = []
             response_masks = []
+            response_token_types = []  # Track which tokens are assistant (1) vs environment (0)
+
+            # IcePop: Collect aligned inference log probs per-step
+            aligned_inference_log_probs_list = []
+
+            # Get cached log probs from vLLM (one per assistant message)
+            cached_log_probs = []
+            if application_id in self.inf_logprobs_cache:
+                cached_log_probs = self.inf_logprobs_cache[application_id]
+
+            assistant_msg_idx = 0
+
             for msg in response_messages:
                 if self.chat_parser:
                     if msg["role"] == "assistant":
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=False)
+                        response_token_types.extend([1] * len(response_token))  # Mark as assistant
+
+                        # IcePop: Align THIS step's vLLM log probs with re-tokenized assistant tokens
+                        # This is CRITICAL for high correlation (per moe-rl implementation)
+                        if assistant_msg_idx < len(cached_log_probs) and cached_log_probs[assistant_msg_idx] is not None:
+                            step_inf_log_probs = cached_log_probs[assistant_msg_idx]
+
+                            # Check if alignment is needed
+                            if len(response_token) != step_inf_log_probs.shape[0]:
+                                print(f"[IcePop-Alignment] Step {assistant_msg_idx}: vLLM tokens={step_inf_log_probs.shape[0]}, "
+                                      f"Re-tokenized={len(response_token)}, adjusting...")
+
+                                if step_inf_log_probs.shape[0] > len(response_token):
+                                    # Trim to match re-tokenized length
+                                    aligned_logprobs = step_inf_log_probs[:len(response_token)]
+                                else:
+                                    # Pad if re-tokenization produced more tokens (rare)
+                                    padding_size = len(response_token) - step_inf_log_probs.shape[0]
+                                    aligned_logprobs = torch.nn.functional.pad(
+                                        step_inf_log_probs, (0, padding_size), value=0.0
+                                    )
+                                aligned_inference_log_probs_list.append(aligned_logprobs)
+                            else:
+                                # Perfect match, no alignment needed
+                                aligned_inference_log_probs_list.append(step_inf_log_probs)
+                                print(f"[IcePop-Alignment] Step {assistant_msg_idx}: Perfect alignment ({len(response_token)} tokens)")
+                        else:
+                            # No log probs for this step (shouldn't happen)
+                            print(f"[IcePop-Alignment] Step {assistant_msg_idx}: No cached log probs!")
+                            aligned_inference_log_probs_list.append(None)
+
+                        assistant_msg_idx += 1
                     else:
                         response_token, response_mask = convert_messages_to_tokens_and_masks([msg], tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=False, contains_generation_msg=True)
+                        response_token_types.extend([0] * len(response_token))  # Mark as environment
                     response_tokens.extend(response_token)
                     response_masks.extend(response_mask)
                 else:
@@ -418,6 +492,7 @@ class AgentExecutionEngine:
                 # Truncate tokens and masks
                 response_tokens = response_tokens[:self.max_response_length]
                 response_masks = response_masks[:self.max_response_length]
+                response_token_types = response_token_types[:self.max_response_length]
                 response_token_len = len(response_tokens)
                 print(f"[TrajectoryLogs] Response length truncated from {original_len} to {response_token_len}")
 
@@ -448,6 +523,60 @@ class AgentExecutionEngine:
                 if masked_out:
                     print(f"[TrajectoryLogs] Trajectory is masked out due to overlong filter.")
 
+            print(f"[IcePop] agent_execution_engine.py: run_agent_trajectory_async - trajectory idx={idx}, "
+                  f"application_id={application_id}, mode={mode}")
+
+            # Extract and process ALIGNED inference log probs for IcePop
+            traj_inf_log_probs = None
+            if aligned_inference_log_probs_list and any(x is not None for x in aligned_inference_log_probs_list):
+                valid_logprobs = [lp for lp in aligned_inference_log_probs_list if lp is not None]
+                if valid_logprobs:
+                    # Concatenate ALIGNED vLLM logprobs (already matched with re-tokenized assistant tokens)
+                    vllm_inf_log_probs = torch.cat(valid_logprobs, dim=0)
+
+                    print(f"[IcePop-Alignment] Total aligned log probs: {vllm_inf_log_probs.shape[0]} tokens "
+                          f"from {len(valid_logprobs)} assistant messages")
+
+                    # Create padded version matching response_tokens length
+                    # response_token_types: 1=assistant, 0=environment
+                    padded_inf_log_probs = torch.zeros(len(response_tokens), dtype=torch.float32)
+
+                    # Fill assistant positions with ALIGNED vLLM logprobs
+                    assistant_positions = [i for i, t in enumerate(response_token_types) if t == 1]
+
+                    # Verify alignment quality
+                    if len(assistant_positions) != vllm_inf_log_probs.shape[0]:
+                        print(f"[IcePop-Alignment] ⚠️  WARNING: Mismatch after alignment! "
+                              f"Assistant positions: {len(assistant_positions)}, "
+                              f"Aligned log probs: {vllm_inf_log_probs.shape[0]}")
+
+                    # Fill with aligned log probs
+                    num_to_fill = min(len(assistant_positions), vllm_inf_log_probs.shape[0])
+                    for i in range(num_to_fill):
+                        padded_inf_log_probs[assistant_positions[i]] = vllm_inf_log_probs[i]
+
+                    traj_inf_log_probs = padded_inf_log_probs
+
+                    if traj_inf_log_probs is not None:
+                        non_zero_count = (traj_inf_log_probs != 0.0).sum().item()
+                        non_zero_ratio = non_zero_count / traj_inf_log_probs.numel()
+                        print(f"[IcePop] agent_execution_engine.py: Created padded inf_log_probs, "
+                              f"shape={traj_inf_log_probs.shape}, "
+                              f"assistant_tokens={len([t for t in response_token_types if t == 1])}, "
+                              f"env_tokens={len([t for t in response_token_types if t == 0])}, "
+                              f"non_zero_count={non_zero_count}, "
+                              f"non_zero_ratio={non_zero_ratio:.4f}")
+
+                        # Expected: non_zero_ratio should be close to assistant_token_ratio
+                        expected_ratio = len([t for t in response_token_types if t == 1]) / len(response_token_types)
+                        if abs(non_zero_ratio - expected_ratio) > 0.02:
+                            print(f"[IcePop-Alignment] ⚠️  WARNING: Non-zero ratio ({non_zero_ratio:.4f}) "
+                                  f"differs from expected ({expected_ratio:.4f})!")
+
+            # Clean up cache
+            if application_id in self.inf_logprobs_cache:
+                del self.inf_logprobs_cache[application_id]
+
             token_result = {
                 "prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long),
                 "response_tokens": torch.tensor(response_tokens, dtype=torch.long),
@@ -458,6 +587,7 @@ class AgentExecutionEngine:
                 "chat_completions": result_messages,
                 "termination_reason": termination_reason,
                 "masked_out": float(masked_out),
+                "inf_log_probs": traj_inf_log_probs,
                 "metrics": {
                     # Total number of steps taken in the trajectory
                     "steps": len(trajectory_result.steps)//2 if hasattr(trajectory_result, 'steps') else 0,
