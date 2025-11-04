@@ -579,11 +579,6 @@ class AgentPPOTrainer(RayPPOTrainer):
             traj_inf_log_probs = traj.get("inf_log_probs", None)
             all_inf_log_probs_list.append(traj_inf_log_probs)
 
-            # Only log for first trajectory to avoid spam
-            if len(all_inf_log_probs_list) == 1 and traj_inf_log_probs is not None:
-                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_trajectories - "
-                      f"First trajectory inf_log_probs shape={traj_inf_log_probs.shape}")
-
             chat_completions.append(traj["chat_completions"])
             traj_metrics.append(traj["metrics"])
             down_infos.append(
@@ -661,12 +656,6 @@ class AgentPPOTrainer(RayPPOTrainer):
                     # Use zeros if not available or length mismatch
                     padded_inf_log_probs.append(torch.zeros(max_response_length, dtype=torch.float32))
             inf_log_probs_batch = torch.stack(padded_inf_log_probs, dim=0)
-
-            if inf_log_probs_batch is not None:
-                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_trajectories - "
-                      f"Created inf_log_probs_batch, shape={inf_log_probs_batch.shape}, "
-                      f"mean={inf_log_probs_batch.mean().item():.4f}, "
-                      f"non_zero_ratio={(inf_log_probs_batch != 0.0).sum().item() / inf_log_probs_batch.numel():.4f}")
 
         traj_mask = torch.nn.utils.rnn.pad_sequence(all_masks_list, batch_first=True, padding_value=0)
         traj_mask = pad_sequence_to_length(traj_mask, max_response_length, 0, left_pad=False)
@@ -892,12 +881,6 @@ class AgentPPOTrainer(RayPPOTrainer):
                     # Use zeros if not available or length mismatch
                     padded_inf_log_probs.append(torch.zeros(max_response_length, dtype=torch.float32))
             inf_log_probs_batch = torch.stack(padded_inf_log_probs, dim=0)
-
-            if inf_log_probs_batch is not None:
-                print(f"[IcePop] agent_ppo_trainer.py: _transform_agent_steps - "
-                      f"Created inf_log_probs_batch, shape={inf_log_probs_batch.shape}, "
-                      f"mean={inf_log_probs_batch.mean().item():.4f}, "
-                      f"non_zero_ratio={(inf_log_probs_batch != 0.0).sum().item() / inf_log_probs_batch.numel():.4f}")
 
         complete_step_batch = torch.concat([prompts_batch, response_batch], dim=1)
         attention_mask = torch.where(complete_step_batch != self.tokenizer.pad_token_id, 1, 0)

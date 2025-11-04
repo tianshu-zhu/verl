@@ -224,7 +224,6 @@ class FSDPActorConfig(ActorConfig):
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
-        default_local_dir (Optional[str]): Default local directory for saving outputs (e.g., plots, logs)
     """
 
     strategy: str = "fsdp"
@@ -235,7 +234,6 @@ class FSDPActorConfig(ActorConfig):
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
-    default_local_dir: Optional[str] = None
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

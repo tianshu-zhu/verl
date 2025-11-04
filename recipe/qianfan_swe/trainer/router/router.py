@@ -346,24 +346,6 @@ class Router:
                     inf_logprobs.append(token_logprobs)
             batch_inference_logprobs.append(inf_logprobs)
 
-            # Debug logging for IcePop (only first prompt to avoid spam)
-            if batch_index == 0 and inf_logprobs and len(inf_logprobs) > 0 and len(inf_logprobs[0]) > 0:
-                sample_values = inf_logprobs[0][:20] if len(inf_logprobs[0]) >= 20 else inf_logprobs[0]
-                print(f"\n[IcePop-DEBUG] router.py: vLLM Extraction Details")
-                print(f"  batch_index={batch_index}, num_choices={len(inf_logprobs)}")
-                print(f"  first_choice_tokens={len(inf_logprobs[0])}")
-                print(f"  Sample logprobs (first 20): {[f'{x:.6f}' for x in sample_values]}")
-                print(f"  Min: {min(inf_logprobs[0]):.6f}, Max: {max(inf_logprobs[0]):.6f}")
-                print(f"  Mean: {sum(inf_logprobs[0])/len(inf_logprobs[0]):.6f}")
-                # Check if values look like probabilities (>0) instead of log probs (<0)
-                positive_count = sum(1 for x in inf_logprobs[0] if x > 0)
-                if positive_count > 0:
-                    print(f"  ⚠️  WARNING: {positive_count} positive values found! These should be negative (log probs)!")
-                near_zero_count = sum(1 for x in inf_logprobs[0] if x > -0.01 and x < 0)
-                if near_zero_count > len(inf_logprobs[0]) * 0.5:
-                    print(f"  ⚠️  WARNING: {near_zero_count}/{len(inf_logprobs[0])} values very close to 0!")
-                    print(f"      This might indicate probabilities instead of log probabilities!")
-
         return await self.postprocess_batch(batch, batch_response_ids, kwargs["n"], batch_inference_logprobs)
 
     async def submit_completions(self, address, model, prompt, **kwargs):
@@ -449,10 +431,6 @@ class Router:
                 0.0,  # Pad with 0.0 for log probs
                 max_length=self.config.actor_rollout_ref.rollout.response_length
             ).to(idx.device)
-
-            print(f"[IcePop] router.py: postprocess_batch - inf_log_probs_tensor shape={inf_log_probs_tensor.shape}, "
-                  f"mean={inf_log_probs_tensor.mean().item():.4f}, "
-                  f"non_zero_ratio={(inf_log_probs_tensor != 0.0).sum().item() / inf_log_probs_tensor.numel():.4f}")
 
         output = TensorDict(
             {
