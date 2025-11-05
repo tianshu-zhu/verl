@@ -74,8 +74,8 @@ class ActorConfig(BaseConfig):
         entropy_coeff (float): Entropy coefficient for regularization.
         tis_imp_ratio_cap (float): Cap for TIS (Truncated Importance Sampling) ratio. Set to -1 to disable.
         enable_icepop (bool): Whether to enable IcePop double-sided masking to filter noisy gradients.
-        icepop_alpha (float): Lower bound for IcePop probability ratio (p_train/p_infer). Default: 0.5.
-        icepop_beta (float): Upper bound for IcePop probability ratio (p_train/p_infer). Default: 2.0.
+        icepop_alpha (float): Lower bound for IcePop probability ratio (p_train/p_rollout). Default: 0.5.
+        icepop_beta (float): Upper bound for IcePop probability ratio (p_train/p_rollout). Default: 2.0.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -129,7 +129,6 @@ class ActorConfig(BaseConfig):
     n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     grad_norm_threshold: float = 1e5
-    default_local_dir: Optional[str] = None  # Default local directory for saving outputs (e.g., plots, logs)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
