@@ -1009,10 +1009,38 @@ def compute_policy_loss_vanilla(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
+    # TIS (Truncated Importance Sampling) for vanilla DAPO mode
+    # Corrects sampler-learner mismatch by applying token-level importance weighting
+    # ρ̃_t = min(π_sampler/π_learner, C) where π_sampler = rollout policy, π_learner = old policy
     if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
-        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
+        # Compute token-level TIS ratio: ρ_t = exp(log π_sampler - log π_learner) = π_sampler / π_learner
+        # Then apply upper-bound clipping: ρ̃_t = min(ρ_t, C)
         tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
+        tis_imp_ratio_uncapped = tis_imp_ratio.clone()  # Keep for statistics
         tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+
+        # Debug: Log TIS statistics
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            with torch.no_grad():
+                # Compute statistics on valid tokens only
+                valid_mask = response_mask > 0
+                if valid_mask.any():
+                    valid_ratios = tis_imp_ratio_uncapped[valid_mask]
+                    capped_count = (tis_imp_ratio_uncapped[valid_mask] > config.tis_imp_ratio_cap).sum().item()
+                    total_valid = valid_mask.sum().item()
+                    capping_ratio = capped_count / total_valid if total_valid > 0 else 0.0
+
+                    print(f"[TIS+IcePop-DEBUG] TIS (Token-level DAPO) Statistics:")
+                    print(f"  Clip threshold C: {config.tis_imp_ratio_cap}")
+                    print(f"  Importance ratio (uncapped): min={valid_ratios.min().item():.4f}, "
+                          f"max={valid_ratios.max().item():.4f}, mean={valid_ratios.mean().item():.4f}, "
+                          f"median={valid_ratios.median().item():.4f}")
+                    print(f"  Capped tokens: {capped_count}/{total_valid} ({capping_ratio*100:.2f}%)")
+                    print(f"  Importance ratio (capped): min={tis_imp_ratio[valid_mask].min().item():.4f}, "
+                          f"max={tis_imp_ratio[valid_mask].max().item():.4f}, "
+                          f"mean={tis_imp_ratio[valid_mask].mean().item():.4f}")
+
+        # Apply TIS weighting to policy loss
         pg_losses = pg_losses * tis_imp_ratio
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
