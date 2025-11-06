@@ -521,7 +521,7 @@ class AgentExecutionEngine:
 
                     traj_rollout_log_probs = padded_rollout_log_probs
 
-            # Clean up cache
+            # Clean up cache (early cleanup for memory efficiency)
             if application_id in self.rollout_log_probs_cache:
                 del self.rollout_log_probs_cache[application_id]
 
@@ -554,6 +554,10 @@ class AgentExecutionEngine:
             raise Exception(f"error msg is {e}, corresponding traceback code is : {stack_trace}")
             
         finally:
+            # Ensure cache cleanup even on exceptions (safety net for memory leak prevention)
+            if application_id in self.rollout_log_probs_cache:
+                del self.rollout_log_probs_cache[application_id]
+
             # Always kill pod when trajectory completes or fails
             pod_manager = self.pod_managers[idx] if hasattr(self, 'pod_managers') and idx < len(self.pod_managers) else None
             if pod_name and pod_manager:
@@ -591,17 +595,21 @@ class AgentExecutionEngine:
         """
         for ind in range(self.retry_limit):
             try:
+                # Clear stale cache before retry to prevent cache pollution (defense-in-depth)
+                if ind > 0 and application_id in self.rollout_log_probs_cache:
+                    del self.rollout_log_probs_cache[application_id]
+
                 return await asyncio.wait_for(self.run_agent_trajectory_async(idx, application_id=application_id, seed=seed, mode=mode, **kwargs), timeout=7200)
             except Exception as e:
                 stack_trace = traceback.format_exc()
                 print(f"[TrainingLogs] func run_agent_trajectory_with_retry, generate trajectory error, error msg is {e}, response params is idx: {idx}, application_id: {application_id}, mode: {mode}, kwargs: {kwargs}, corresponding traceback code is : {stack_trace}, retry is {ind}/{self.retry_limit}")
                 traceback.print_exc()
-                
+
                 # Reset pod for retry if PodManager is available and this is not the last attempt
                 pod_manager = self.pod_managers[idx] if hasattr(self, 'pod_managers') and idx < len(self.pod_managers) else None
                 if pod_manager and ind < self.retry_limit - 1:
                     await self._reset_pod_for_retry(idx, pod_manager)
-                
+
                 continue
         traceback.print_exc()
         raise Exception(f"Trajectory {idx} cannot complete. Please check the log message")
